@@ -9,22 +9,63 @@
 if node[:rails][:app][:name].split(" ").count > 1
   Chef::Application.fatal!("Application name must be one word long !")
 end
+
+include_recipe "runit"
+
 include_recipe "git" # install git, no support for svn for now
+
 include_recipe "ruby::#{node[:rails][:ruby][:version]}" # install ruby
 include_recipe "ruby::symlinks"
 
 # create deploy user & group
 user node[:rails][:owner] do
+  Chef::Log.info("create user #{node[:rails][:owner]}")
   action :create
+
   supports manage_home => true
+  notifies :run, "execute[generate_ssh_key_for_#{node[:rails][:owner]}]"
 end
+
+
+directory File.join('/','home',node[:rails][:owner]) do
+  owner node[:rails][:owner]
+  group node[:rails][:group]
+end
+
+
 group node[:rails][:group] do
   action :create
   members node[:rails][:owner]
 end
-directory File.join('/','home',node[:rails][:owner]) do
-  owner node[:rails][:owner]
-  group node[:rails][:group]
+
+execute "generate_ssh_key_for_#{node[:rails][:owner]}"  do
+  action :nothing # only run when user is created
+
+  Chef::Log.info("generate_ssh_key_for_#{node[:rails][:owner]}")
+
+  user node[:rails][:owner]
+  command "ssh-keygen -t rsa -q -f /home/#{node[:rails][:owner]}/.ssh/id_rsa -P \"\" && cp /home/#{node[:rails][:owner]}/.ssh/id_rsa.pub /tmp/#{node[:rails][:owner]}.pub"
+
+  notifies :run, "execute[add_repo_to_known_hosts]"
+  notifies :run, "execute[add_ssh_key_to_git_server]"
+end
+
+# add git repo to known hosts, so future deploys won't be interrupted
+execute "add_repo_to_known_hosts" do
+  action :nothing # only run when ssh key is created
+
+  Chef::Log.info "add_repo_to_known_hosts"
+
+  user "#{node[:rails][:owner]}"
+  command "ssh-keyscan -H #{node[:rails][:deploy][:repository].split(/@|:/)[1]} >> /home/#{node[:rails][:owner]}/.ssh/known_hosts"
+end
+
+# send id_rsa.pub over to Bitbucket as a new deploy key
+execute "add_ssh_key_to_git_server" do
+  action :nothing # only run when ssh key is created
+  Chef::Log.info "add_ssh_key_to_git_server"
+
+  command "scp /tmp/#{node[:rails][:owner]}.pub git_olite@justizroush.cc:~/git.justizroush.cc/keydir/deploy@#{node['fqdn'].sub('.', '-')}.pub; ssh git_olite@justizroush.cc \"cd git.justizroush.cc/keydir && git add . && git commit -m \"added deploy key for #{node['fqdn'].sub('.', '-')}\" && git push\""
 end
 
 # save generated or provided database password in the node itself
@@ -46,6 +87,7 @@ application node[:rails][:app][:name] do
   if node[:rails][:deploy][:ssh_key]
     deploy_key node[:rails][:deploy][:ssh_key]
   end
+
   repository        node[:rails][:deploy][:repository]
   revision          node[:rails][:deploy][:revision]
   enable_submodules node[:rails][:deploy][:enable_submodules]
@@ -76,6 +118,7 @@ application node[:rails][:app][:name] do
     precompile_assets      node[:rails][:deploy][:precompile_assets]
     database_master_role   node[:rails][:deploy][:database_master_role]
     database_template      node[:rails][:deploy][:database_template]
+
     gems                   node[:rails][:gems] | [ "bundler" ]
     # can't put node[:rails][...] things inside the database block
     database do
@@ -85,9 +128,11 @@ application node[:rails][:app][:name] do
       username db_username
       password db_password
     end
+
   end
 
   before_deploy do
+
     execute "upstart-reload-configuration" do
       command "/sbin/initctl reload-configuration"
       action [:nothing]
@@ -122,9 +167,11 @@ application node[:rails][:app][:name] do
       supports status: true, restart: true
       action :nothing
     end
+
   end
 
   unicorn do
+
     worker_processes node[:rails][:unicorn][:worker_processes]
     worker_timeout   node[:rails][:unicorn][:worker_timeout]
     preload_app      node[:rails][:unicorn][:preload_app]
@@ -132,14 +179,18 @@ application node[:rails][:app][:name] do
     port             node[:rails][:unicorn][:port]
     bundler          node[:rails][:unicorn][:bundler]
     bundle_command   node[:rails][:unicorn][:bundle_command]
+
+    # Figure this out.
+    # forked_user      node[:rails][:owner]
+    # forked_group     node[:rails][:group]
+
     restart_command  do  # when a string is used, it will run it as owner/group not as root!
       service "unicorn_#{node[:rails][:app][:name]}" do
         provider Chef::Provider::Service::Upstart
         action [ :restart ]
       end
     end
-    forked_user      node[:rails][:owner]
-    forked_group     node[:rails][:group]
+
   end
 
   nginx_load_balancer do
